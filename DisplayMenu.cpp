@@ -469,7 +469,7 @@ void begin(const Callbacks &callbacks) {
     displayOk_ = u8g2.begin();
     if (!displayOk_) {
         Serial.println(F("[Display] u8g2.begin() не подтвердил инициализацию дисплея."));
-        Serial.println(F("[Display] Проверьте: питание OLED (3.3В), SDA=D6(GPIO12) SCL=D5(GPIO14),"));
+        Serial.println(F("[Display] Проверьте: питание OLED (3.3В), SDA=D5(GPIO14) SCL=D6(GPIO12),"));
         Serial.println(F("[Display] а также адрес I2C платы (по умолчанию 0x3C - см. README, если у вас модуль на 0x3D)."));
     } else {
         Serial.println(F("[Display] OLED инициализирован"));
