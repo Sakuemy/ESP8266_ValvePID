@@ -8,7 +8,9 @@ static bool haveReading_ = false;
 static unsigned long lastReadMs_ = 0;
 
 static float rawAdcToVoltage(int adcValue) {
-    float v = (adcValue / 1023.0f) * BATTERY_BOARD_ADC_MAX_V * BATTERY_EXTERNAL_DIVIDER_RATIO;
+    // settings_.dividerRatio - коэффициент ВНЕШНЕГО делителя напряжения,
+    // настраивается в веб-интерфейсе/меню без перепрошивки (см. Config.h).
+    float v = (adcValue / 1023.0f) * BATTERY_BOARD_ADC_MAX_V * settings_.dividerRatio;
     return v;
 }
 

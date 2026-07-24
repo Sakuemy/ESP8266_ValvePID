@@ -68,6 +68,10 @@ bool load(AppSettings &settings) {
     // Батарея
     settings.battery.voltageAt0Percent   = doc["battery"]["v0"]   | 3.0;
     settings.battery.voltageAt100Percent = doc["battery"]["v100"] | 4.2;
+    settings.battery.dividerRatio        = doc["battery"]["dividerRatio"] | BATTERY_DEFAULT_DIVIDER_RATIO;
+
+    // Доступ к настройкам
+    strlcpy(settings.admin.password, doc["admin"]["password"] | DEFAULT_ADMIN_PASSWORD, sizeof(settings.admin.password));
 
     return true;
 }
@@ -93,8 +97,11 @@ bool save(const AppSettings &settings) {
     doc["net"]["subnet"]   = settings.network.staticSubnet;
     doc["net"]["dns"]      = settings.network.staticDns;
 
-    doc["battery"]["v0"]   = settings.battery.voltageAt0Percent;
-    doc["battery"]["v100"] = settings.battery.voltageAt100Percent;
+    doc["battery"]["v0"]           = settings.battery.voltageAt0Percent;
+    doc["battery"]["v100"]         = settings.battery.voltageAt100Percent;
+    doc["battery"]["dividerRatio"] = settings.battery.dividerRatio;
+
+    doc["admin"]["password"] = settings.admin.password;
 
     // Пишем во временный файл и затем переименовываем — так при внезапном
     // отключении питания старый рабочий конфиг не будет повреждён.

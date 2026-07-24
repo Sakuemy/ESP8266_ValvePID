@@ -15,6 +15,22 @@ static ESP8266WebServer server(80);
 static Callbacks callbacks_;
 
 // ----------------------------------------------------------------------
+// Доступ по паролю (HTTP Basic Auth) к странице настроек и её API.
+// Дашборд (/, /api/status, /api/history) остаётся открытым для мониторинга.
+// Логин фиксирован (ADMIN_USERNAME), пароль - из settings.admin.password,
+// его можно сменить через /settings ("Безопасность") или через меню на
+// дисплее. Возвращает false и уже отправляет клиенту 401, если не прошли
+// проверку - вызывающий обработчик должен в этом случае просто выйти.
+static bool requireAuth() {
+    AppSettings *s = callbacks_.getSettings();
+    if (!server.authenticate(ADMIN_USERNAME, s->admin.password)) {
+        server.requestAuthentication();
+        return false;
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------
 // HTML хранится в PROGMEM, чтобы не занимать оперативную память постоянно.
 // Копия во временный буфер делается только на время обработки запроса.
 // ----------------------------------------------------------------------
@@ -145,12 +161,23 @@ button{margin-top:14px;padding:10px 18px;border:none;border-radius:6px;backgroun
 
 <div class="card"><h1>Батарея</h1>
 <p style="font-size:13px;color:#555;margin-top:0">Укажите реальное напряжение батареи, соответствующее 0% и 100% заряда (измерьте мультиметром на полностью разряженной и полностью заряженной батарее).</p>
+<p style="font-size:13px;color:#555">Если на пин A0 батарея подключена через собственный (внешний) резистивный делитель напряжения, укажите его коэффициент: ratio = (R1+R2)/R2, где R1 - от плюса батареи к A0, R2 - от A0 к земле. Если делителя нет (кроме встроенного в плату) - оставьте 1.</p>
 <form id="battForm">
 <div class="grid">
 <div><label>Напряжение при 0%, В<input type="number" step="0.01" name="v0"></label></div>
 <div><label>Напряжение при 100%, В<input type="number" step="0.01" name="v100"></label></div>
+<div><label>Коэффициент делителя (A0)<input type="number" step="0.001" min="1" name="dividerRatio"></label></div>
 </div>
 <button type="submit">Сохранить калибровку батареи</button><div class="msg" id="battMsg"></div>
+</form></div>
+
+<div class="card"><h1>Безопасность</h1>
+<p style="font-size:13px;color:#555;margin-top:0">Пароль для входа в эти настройки (веб и меню на дисплее). Логин фиксирован: <b>admin</b>.</p>
+<form id="secForm">
+<label>Текущий пароль<input type="password" name="currentPassword" autocomplete="current-password"></label>
+<label>Новый пароль<input type="password" name="newPassword" maxlength="32" autocomplete="new-password"></label>
+<label>Повторите новый пароль<input type="password" name="newPasswordConfirm" maxlength="32" autocomplete="new-password"></label>
+<button type="submit">Сменить пароль</button><div class="msg" id="secMsg"></div>
 </form></div>
 
 <div class="card"><h1>Wi-Fi / сеть</h1>
@@ -181,7 +208,7 @@ async function loadSettings(){
   sf.minPercent.value = d.servo.minPercent; sf.maxPercent.value = d.servo.maxPercent;
   sf.closedPulseUs.value = d.servo.closedPulseUs; sf.openPulseUs.value = d.servo.openPulseUs;
   const bf = document.getElementById('battForm');
-  bf.v0.value = d.battery.v0; bf.v100.value = d.battery.v100;
+  bf.v0.value = d.battery.v0; bf.v100.value = d.battery.v100; bf.dividerRatio.value = d.battery.dividerRatio;
   const nf = document.getElementById('netForm');
   nf.ssid.value = d.net.ssid; nf.dhcp.value = d.net.dhcp ? '1':'0';
   nf.ip.value = ipToStr(d.net.ip); nf.gateway.value = ipToStr(d.net.gateway);
@@ -209,7 +236,26 @@ document.getElementById('servoForm').addEventListener('submit', function(e){
 document.getElementById('battForm').addEventListener('submit', function(e){
   e.preventDefault();
   const f = e.target;
-  postForm('/api/settings/battery', {v0:f.v0.value, v100:f.v100.value}, 'battMsg');
+  postForm('/api/settings/battery', {v0:f.v0.value, v100:f.v100.value, dividerRatio:f.dividerRatio.value}, 'battMsg');
+});
+document.getElementById('secForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const f = e.target;
+  const msg = document.getElementById('secMsg');
+  if (f.newPassword.value !== f.newPasswordConfirm.value) {
+    msg.textContent = 'Новые пароли не совпадают'; msg.style.color = 'red'; return;
+  }
+  if (f.newPassword.value.length < 4) {
+    msg.textContent = 'Пароль слишком короткий (мин. 4 симв.)'; msg.style.color = 'red'; return;
+  }
+  msg.textContent = 'Сохранение...';
+  try{
+    const r = await fetch('/api/settings/security', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({currentPassword:f.currentPassword.value, newPassword:f.newPassword.value})});
+    const d = await r.json().catch(()=>({}));
+    if (r.ok && d.ok) { msg.textContent = 'Пароль изменён'; msg.style.color = 'green'; f.reset(); }
+    else { msg.textContent = d.error || 'Ошибка: неверный текущий пароль'; msg.style.color = 'red'; }
+  }catch(e){ msg.textContent = 'Ошибка сети'; msg.style.color = 'red'; }
 });
 document.getElementById('netForm').addEventListener('submit', function(e){
   e.preventDefault();
@@ -233,6 +279,7 @@ static void handleIndex() {
 }
 
 static void handleSettingsPage() {
+    if (!requireAuth()) return;
     server.send_P(200, "text/html", PAGE_SETTINGS);
 }
 
@@ -263,6 +310,7 @@ static void handleApiHistory() {
 }
 
 static void handleApiSettingsGet() {
+    if (!requireAuth()) return;
     AppSettings *s = callbacks_.getSettings();
     StaticJsonDocument<CONFIG_JSON_CAPACITY> doc;
 
@@ -286,6 +334,7 @@ static void handleApiSettingsGet() {
 
     doc["battery"]["v0"] = s->battery.voltageAt0Percent;
     doc["battery"]["v100"] = s->battery.voltageAt100Percent;
+    doc["battery"]["dividerRatio"] = s->battery.dividerRatio;
 
     String out;
     serializeJson(doc, out);
@@ -293,6 +342,7 @@ static void handleApiSettingsGet() {
 }
 
 static void handleApiSettingsPid() {
+    if (!requireAuth()) return;
     AppSettings *s = callbacks_.getSettings();
     if (server.hasArg("kp")) s->pid.kp = server.arg("kp").toDouble();
     if (server.hasArg("ki")) s->pid.ki = server.arg("ki").toDouble();
@@ -305,6 +355,7 @@ static void handleApiSettingsPid() {
 }
 
 static void handleApiSettingsServo() {
+    if (!requireAuth()) return;
     AppSettings *s = callbacks_.getSettings();
     if (server.hasArg("minPercent")) s->servo.minPercent = (uint8_t)constrain(server.arg("minPercent").toInt(), 0, 100);
     if (server.hasArg("maxPercent")) s->servo.maxPercent = (uint8_t)constrain(server.arg("maxPercent").toInt(), 0, 100);
@@ -324,16 +375,52 @@ static void handleApiSettingsServo() {
 }
 
 static void handleApiSettingsBattery() {
+    if (!requireAuth()) return;
     AppSettings *s = callbacks_.getSettings();
     if (server.hasArg("v0")) s->battery.voltageAt0Percent = server.arg("v0").toFloat();
     if (server.hasArg("v100")) s->battery.voltageAt100Percent = server.arg("v100").toFloat();
+    if (server.hasArg("dividerRatio")) {
+        float ratio = server.arg("dividerRatio").toFloat();
+        if (ratio < 1.0f) ratio = 1.0f; // делитель не может "усиливать" напряжение
+        s->battery.dividerRatio = ratio;
+    }
 
     Storage::save(*s);
     if (callbacks_.onSettingsChanged) callbacks_.onSettingsChanged();
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Смена пароля доступа к настройкам. Требует правильный текущий пароль,
+// иначе тот, кто уже случайно оставил браузер авторизованным, не мог бы
+// незаметно "увести" устройство сменой пароля без знания старого.
+static void handleApiSettingsSecurity() {
+    if (!requireAuth()) return;
+    AppSettings *s = callbacks_.getSettings();
+
+    String current = server.hasArg("currentPassword") ? server.arg("currentPassword") : "";
+    String newPass  = server.hasArg("newPassword") ? server.arg("newPassword") : "";
+
+    if (current != String(s->admin.password)) {
+        server.send(403, "application/json", "{\"ok\":false,\"error\":\"Неверный текущий пароль\"}");
+        return;
+    }
+    if (newPass.length() < 4) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Пароль слишком короткий\"}");
+        return;
+    }
+    if (newPass.length() >= sizeof(s->admin.password)) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Пароль слишком длинный\"}");
+        return;
+    }
+
+    strlcpy(s->admin.password, newPass.c_str(), sizeof(s->admin.password));
+    Storage::save(*s);
+    if (callbacks_.onSettingsChanged) callbacks_.onSettingsChanged();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
 static void handleApiSettingsNetwork() {
+    if (!requireAuth()) return;
     AppSettings *s = callbacks_.getSettings();
     if (server.hasArg("ssid")) strlcpy(s->network.ssid, server.arg("ssid").c_str(), sizeof(s->network.ssid));
     if (server.hasArg("password") && server.arg("password").length() > 0) {
@@ -370,6 +457,7 @@ void begin(const Callbacks &callbacks) {
     server.on("/api/settings/servo", HTTP_POST, handleApiSettingsServo);
     server.on("/api/settings/battery", HTTP_POST, handleApiSettingsBattery);
     server.on("/api/settings/network", HTTP_POST, handleApiSettingsNetwork);
+    server.on("/api/settings/security", HTTP_POST, handleApiSettingsSecurity);
     server.onNotFound(handleNotFound);
 
     server.begin();
