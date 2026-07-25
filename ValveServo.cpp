@@ -72,7 +72,15 @@ void update() {
     if (clamped > settings_.maxPercent) clamped = settings_.maxPercent;
 
     if (clamped != currentPercent_) {
-        currentPercent_ = clamped;
+        // Плавный ход: не прыгаем сразу на целевое значение, а двигаемся
+        // к нему не быстрее SERVO_MAX_STEP_PERCENT_PER_UPDATE за такт -
+        // так резкая команда (скачок ПИД, вход/выход из теста) не дёргает
+        // кран рывком на весь диапазон за одно обновление.
+        double diff = clamped - currentPercent_;
+        if (diff > SERVO_MAX_STEP_PERCENT_PER_UPDATE) diff = SERVO_MAX_STEP_PERCENT_PER_UPDATE;
+        if (diff < -SERVO_MAX_STEP_PERCENT_PER_UPDATE) diff = -SERVO_MAX_STEP_PERCENT_PER_UPDATE;
+        currentPercent_ += diff;
+
         if (attached_) {
             servo.writeMicroseconds(percentToPulse(currentPercent_));
         }

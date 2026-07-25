@@ -99,6 +99,8 @@ enum class Screen : uint8_t {
     EDIT_SETPOINT,
     EDIT_MIN_PERCENT,
     EDIT_MAX_PERCENT,
+    EDIT_SERVO_CLOSED_PULSE,
+    EDIT_SERVO_OPEN_PULSE,
     TEST_VALVE,
     EDIT_BATTERY_V0,
     EDIT_BATTERY_V100,
@@ -114,7 +116,7 @@ enum class Screen : uint8_t {
 
 static Screen screen_ = Screen::MENU;
 static int menuIndex_ = 0;
-static const int MENU_ITEMS_COUNT = 18;
+static const int MENU_ITEMS_COUNT = 20;
 static const char *MENU_LABELS[MENU_ITEMS_COUNT] = {
     "Температура",
     "IP адрес",
@@ -125,6 +127,8 @@ static const char *MENU_LABELS[MENU_ITEMS_COUNT] = {
     "Уставка, C",
     "Мин. открытие %",
     "Макс. открытие %",
+    "Импульс закрыто, мкс",
+    "Импульс открыто, мкс",
     "Тест: угол крана",
     "Батарея: калибр. 0%",
     "Батарея: калибр. 100%",
@@ -184,7 +188,9 @@ static void enterMenuItem(int idx, AppSettings *s) {
         case 6: screen_ = Screen::EDIT_SETPOINT; break;
         case 7: screen_ = Screen::EDIT_MIN_PERCENT; break;
         case 8: screen_ = Screen::EDIT_MAX_PERCENT; break;
-        case 9:
+        case 9: screen_ = Screen::EDIT_SERVO_CLOSED_PULSE; break;
+        case 10: screen_ = Screen::EDIT_SERVO_OPEN_PULSE; break;
+        case 11:
             // Тестовый поворот крана: захватываем ручное управление у ПИД
             // и стартуем от текущего фактического положения, чтобы первый
             // же поворот энкодера не дёрнул кран резко.
@@ -193,26 +199,26 @@ static void enterMenuItem(int idx, AppSettings *s) {
             ValveServo::setManualPercent(testValvePercent_);
             screen_ = Screen::TEST_VALVE;
             break;
-        case 10: screen_ = Screen::EDIT_BATTERY_V0; break;
-        case 11: screen_ = Screen::EDIT_BATTERY_V100; break;
-        case 12: screen_ = Screen::EDIT_BATTERY_DIVIDER; break;
-        case 13:
+        case 12: screen_ = Screen::EDIT_BATTERY_V0; break;
+        case 13: screen_ = Screen::EDIT_BATTERY_V100; break;
+        case 14: screen_ = Screen::EDIT_BATTERY_DIVIDER; break;
+        case 15:
             strlcpy(textBuffer_, s->network.ssid, sizeof(textBuffer_));
             textLen_ = strlen(textBuffer_);
             textCharIndex_ = 0;
             textEditTarget_ = TextEditTarget::SSID;
             screen_ = Screen::EDIT_SSID;
             break;
-        case 14:
+        case 16:
             textBuffer_[0] = '\0';
             textLen_ = 0;
             textCharIndex_ = 0;
             textEditTarget_ = TextEditTarget::ADMIN_PASSWORD;
             screen_ = Screen::EDIT_SSID; // используем тот же экран-редактор текста
             break;
-        case 15: screen_ = Screen::EDIT_SLEEP_ENABLED; break;
-        case 16: screen_ = Screen::EDIT_SLEEP_TIMEOUT; break;
-        case 17: screen_ = Screen::SAVE_CONFIRM; break;
+        case 17: screen_ = Screen::EDIT_SLEEP_ENABLED; break;
+        case 18: screen_ = Screen::EDIT_SLEEP_TIMEOUT; break;
+        case 19: screen_ = Screen::SAVE_CONFIRM; break;
         default: screen_ = Screen::MENU; break;
     }
 }
@@ -267,6 +273,11 @@ static void applyEncoderToBool(bool &value) {
 // ---------------------- Отрисовка ----------------------
 static void drawMenuScreen() {
     u8g2.setFont(u8g2_font_6x10_tr);
+    // Напоминание, что кран сейчас под ручным управлением (тест угла),
+    // а не под ПИД - легко забыть, выйдя из экрана теста другим путём.
+    if (ValveServo::isManualOverrideActive()) {
+        u8g2.drawStr(0, 8, "[РУЧН]");
+    }
     u8g2.drawStr(100, 8, unlocked_ ? "[откр]" : "[закр]");
 
     int visibleStart = 0;
@@ -440,6 +451,11 @@ static void handleNumberEditScreen(AppSettings *s) {
         case Screen::EDIT_SLEEP_ENABLED: applyEncoderToBool(s->display.sleepEnabled); break;
         // Таймаут сна: шаг 5с, от 5с до 10 минут (600с).
         case Screen::EDIT_SLEEP_TIMEOUT: applyEncoderToUint16(s->display.sleepTimeoutSec, 5, 5, 600); break;
+        // Калибровка импульсов сервопривода: диапазон 500..2500 мкс -
+        // соответствует расширенному диапазону servo.attach() в ValveServo,
+        // шаг 10 мкс для достаточно точной, но не слишком медленной настройки.
+        case Screen::EDIT_SERVO_CLOSED_PULSE: applyEncoderToUint16(s->servo.closedPulseUs, 10, 500, 2500); break;
+        case Screen::EDIT_SERVO_OPEN_PULSE: applyEncoderToUint16(s->servo.openPulseUs, 10, 500, 2500); break;
         default: break;
     }
 
@@ -663,6 +679,8 @@ void update() {
         case Screen::EDIT_SETPOINT: drawNumberEditScreen("Уставка, C", s->pid.setpoint, 1); break;
         case Screen::EDIT_MIN_PERCENT: drawNumberEditScreen("Мин %", s->servo.minPercent, 0); break;
         case Screen::EDIT_MAX_PERCENT: drawNumberEditScreen("Макс %", s->servo.maxPercent, 0); break;
+        case Screen::EDIT_SERVO_CLOSED_PULSE: drawNumberEditScreen("Закрыто, мкс", s->servo.closedPulseUs, 0); break;
+        case Screen::EDIT_SERVO_OPEN_PULSE: drawNumberEditScreen("Открыто, мкс", s->servo.openPulseUs, 0); break;
         case Screen::EDIT_BATTERY_V0: drawNumberEditScreen("Батарея 0%, В", s->battery.voltageAt0Percent, 2); break;
         case Screen::EDIT_BATTERY_V100: drawNumberEditScreen("Батарея 100%, В", s->battery.voltageAt100Percent, 2); break;
         case Screen::EDIT_BATTERY_DIVIDER: drawNumberEditScreen("Коэф. делителя", s->battery.dividerRatio, 3); break;

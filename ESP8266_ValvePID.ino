@@ -42,6 +42,7 @@ static PIDController pid;
 static unsigned long lastPidComputeMs = 0;
 static unsigned long lastSettingsSaveMs = 0;
 static bool settingsSavePending = false;
+static bool batteryCriticalLogged = false; // чтобы не спамить Serial каждый цикл
 
 // ---------------------------------------------------------------------
 // Общие колбэки для веб-сервера и дисплейного меню: они работают с одним
@@ -121,6 +122,26 @@ void loop() {
             // "вслепую" при отказе сенсора.
             ValveServo::setTargetPercent(settings.servo.minPercent);
         }
+    }
+
+    // Критически низкий заряд батареи (если она вообще физически
+    // подключена - см. BatteryMonitor::isConnected()) - принудительно
+    // держим кран в минимальном (безопасном) положении, перекрывая то,
+    // что мог выставить ПИД в этом цикле. Проверяем и применяем ДО
+    // ValveServo::update(), чтобы сработало в этом же такте, а не с
+    // задержкой до следующего. Ничего не сохраняем и не блокируем - как
+    // только заряд восстановится (или батарею зарядят/заменят), обычная
+    // логика вернётся сама, без перезагрузки.
+    bool batteryCritical = BatteryMonitor::isConnected() &&
+                            BatteryMonitor::getPercent() < BATTERY_CRITICAL_PERCENT;
+    if (batteryCritical) {
+        ValveServo::setTargetPercent(settings.servo.minPercent);
+        if (!batteryCriticalLogged) {
+            Serial.println(F("[Main] Критически низкий заряд батареи - кран переведён в безопасное положение"));
+            batteryCriticalLogged = true;
+        }
+    } else {
+        batteryCriticalLogged = false;
     }
 
     ValveServo::update();
