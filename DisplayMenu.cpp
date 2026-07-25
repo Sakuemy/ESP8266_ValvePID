@@ -423,8 +423,17 @@ static void handleNumberEditScreen(AppSettings *s) {
         case Screen::EDIT_KI: applyEncoderToDouble(s->pid.ki, 0.01, 0.0, 100.0); break;
         case Screen::EDIT_KD: applyEncoderToDouble(s->pid.kd, 0.01, 0.0, 100.0); break;
         case Screen::EDIT_SETPOINT: applyEncoderToDouble(s->pid.setpoint, 0.5, 0.0, 150.0); break;
-        case Screen::EDIT_MIN_PERCENT: applyEncoderToInt(s->servo.minPercent, 1, 0, 100); break;
-        case Screen::EDIT_MAX_PERCENT: applyEncoderToInt(s->servo.maxPercent, 1, 0, 100); break;
+        case Screen::EDIT_MIN_PERCENT:
+            applyEncoderToInt(s->servo.minPercent, 1, 0, 100);
+            // Не даём мин. открытию "перескочить" выше макс.: если пользователь
+            // крутит мин. выше текущего макс., макс. подтягивается следом -
+            // как две связанные "ручки" диапазона, без противоречивого состояния.
+            if (s->servo.minPercent > s->servo.maxPercent) s->servo.maxPercent = s->servo.minPercent;
+            break;
+        case Screen::EDIT_MAX_PERCENT:
+            applyEncoderToInt(s->servo.maxPercent, 1, 0, 100);
+            if (s->servo.maxPercent < s->servo.minPercent) s->servo.minPercent = s->servo.maxPercent;
+            break;
         case Screen::EDIT_BATTERY_V0: applyEncoderToFloat(s->battery.voltageAt0Percent, 0.05f, 0.0f, 60.0f); break;
         case Screen::EDIT_BATTERY_V100: applyEncoderToFloat(s->battery.voltageAt100Percent, 0.05f, 0.0f, 60.0f); break;
         case Screen::EDIT_BATTERY_DIVIDER: applyEncoderToFloat(s->battery.dividerRatio, 0.01f, 1.0f, 50.0f); break;

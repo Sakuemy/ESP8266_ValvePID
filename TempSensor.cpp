@@ -13,6 +13,7 @@ static bool conversionInProgress = false;
 static bool haveValidReading = false;
 static float lastTemperature = NAN;
 static unsigned long lastActionMs = 0;
+static unsigned long lastGoodReadingMs = 0; // millis() момента последнего успешного чтения
 
 bool begin() {
     sensors.begin();
@@ -36,6 +37,16 @@ bool begin() {
 
 void update() {
     if (!sensorFound) {
+        // Если данные уже (были) валидны, но датчик не отвечает достаточно
+        // долго - считаем последнее известное значение устаревшим. Именно
+        // на haveValidReading завязана защита в main loop (закрытие крана
+        // при отсутствии данных), поэтому важно не держать её "включённой"
+        // вечно на основании давно неактуального чтения.
+        if (haveValidReading && (millis() - lastGoodReadingMs > SENSOR_INVALID_TIMEOUT_MS)) {
+            haveValidReading = false;
+            Serial.println(F("[TempSensor] Датчик долго не отвечает - последнее значение считается устаревшим"));
+        }
+
         // Периодически пробуем переинициализировать шину — вдруг датчик
         // был подключён позже или произошёл сбой линии.
         if (millis() - lastActionMs > SENSOR_READ_INTERVAL_MS) {
@@ -63,9 +74,14 @@ void update() {
             if (t == DEVICE_DISCONNECTED_C || t < -55.0f || t > 125.0f) {
                 Serial.println(F("[TempSensor] Некорректное чтение, датчик мог отключиться"));
                 sensorFound = false; // заставим перепроверить шину при следующем update()
+                // haveValidReading здесь намеренно не трогаем - единичный
+                // плохой отсчёт может быть наводкой на линии. Он "погаснет"
+                // сам, если проблема не исчезнет дольше SENSOR_INVALID_TIMEOUT_MS
+                // (см. ветку !sensorFound выше).
             } else {
                 lastTemperature = t;
                 haveValidReading = true;
+                lastGoodReadingMs = now;
             }
         }
     }

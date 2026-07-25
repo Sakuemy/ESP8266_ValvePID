@@ -56,6 +56,16 @@ bool load(AppSettings &settings) {
     settings.servo.closedPulseUs = doc["servo"]["closedPulseUs"] | 1000;
     settings.servo.openPulseUs   = doc["servo"]["openPulseUs"]   | 2000;
 
+    // Защита от противоречивых значений в файле настроек (ручное
+    // редактирование JSON, повреждение, старая версия прошивки без этой
+    // проверки и т.п.) - min не должен быть больше max.
+    if (settings.servo.minPercent > settings.servo.maxPercent) {
+        uint8_t tmp = settings.servo.minPercent;
+        settings.servo.minPercent = settings.servo.maxPercent;
+        settings.servo.maxPercent = tmp;
+        Serial.println(F("[Storage] servo.minPercent > maxPercent в файле настроек - переставлены местами"));
+    }
+
     // Сеть
     strlcpy(settings.network.ssid, doc["net"]["ssid"] | "", sizeof(settings.network.ssid));
     strlcpy(settings.network.password, doc["net"]["password"] | "", sizeof(settings.network.password));
