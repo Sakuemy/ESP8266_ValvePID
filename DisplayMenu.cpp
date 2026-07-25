@@ -3,6 +3,7 @@
 #include "TempSensor.h"
 #include "NetworkManager.h"
 #include "BatteryMonitor.h"
+#include "ValveServo.h"
 
 namespace DisplayMenu {
 
@@ -98,6 +99,7 @@ enum class Screen : uint8_t {
     EDIT_SETPOINT,
     EDIT_MIN_PERCENT,
     EDIT_MAX_PERCENT,
+    TEST_VALVE,
     EDIT_BATTERY_V0,
     EDIT_BATTERY_V100,
     EDIT_BATTERY_DIVIDER,
@@ -105,12 +107,14 @@ enum class Screen : uint8_t {
     EDIT_ADMIN_PASSWORD,
     ENTER_PASSWORD,
     EDIT_DHCP_TOGGLE,
+    EDIT_SLEEP_ENABLED,
+    EDIT_SLEEP_TIMEOUT,
     SAVE_CONFIRM
 };
 
 static Screen screen_ = Screen::MENU;
 static int menuIndex_ = 0;
-static const int MENU_ITEMS_COUNT = 15;
+static const int MENU_ITEMS_COUNT = 18;
 static const char *MENU_LABELS[MENU_ITEMS_COUNT] = {
     "Температура",
     "IP адрес",
@@ -121,11 +125,14 @@ static const char *MENU_LABELS[MENU_ITEMS_COUNT] = {
     "Уставка, C",
     "Мин. открытие %",
     "Макс. открытие %",
+    "Тест: угол крана",
     "Батарея: калибр. 0%",
     "Батарея: калибр. 100%",
     "Батарея: коэф. делителя",
     "Wi-Fi SSID",
     "Сменить пароль",
+    "Сон экрана вкл/выкл",
+    "Таймаут сна, с",
     "Сохранить/выход"
 };
 
@@ -147,6 +154,12 @@ static TextEditTarget textEditTarget_ = TextEditTarget::NONE;
 
 static bool dirty_ = false; // есть несохранённые изменения
 
+// ---------------------- Тест угла открытия крана ----------------------
+// Текущее выставляемое вручную значение % открытия на экране теста.
+// Не хранится в настройках и не сохраняется в Flash - это разовое
+// действие "покрутить кран и посмотреть", а не изменение конфигурации.
+static double testValvePercent_ = 0.0;
+
 // ---------------------- Доступ по паролю ----------------------
 // Разблокировка живёт только в оперативной памяти на время сессии работы
 // с меню и автоматически "гаснет" после MENU_LOCK_TIMEOUT_MS бездействия -
@@ -157,6 +170,12 @@ static int pendingMenuIndex_ = -1; // пункт меню, куда перейт
 static bool wrongPassword_ = false;
 static unsigned long wrongPasswordShownMs_ = 0;
 
+// ---------------------- Сон экрана ----------------------
+// Гасим OLED после периода бездействия (см. AppSettings::display).
+// Выход из сна - только по короткому клику кнопки энкодера; сам этот
+// клик "съедается" пробуждением и не выполняет никакого действия в меню.
+static bool sleeping_ = false;
+
 static void enterMenuItem(int idx, AppSettings *s) {
     switch (idx) {
         case 3: screen_ = Screen::EDIT_KP; break;
@@ -165,24 +184,35 @@ static void enterMenuItem(int idx, AppSettings *s) {
         case 6: screen_ = Screen::EDIT_SETPOINT; break;
         case 7: screen_ = Screen::EDIT_MIN_PERCENT; break;
         case 8: screen_ = Screen::EDIT_MAX_PERCENT; break;
-        case 9: screen_ = Screen::EDIT_BATTERY_V0; break;
-        case 10: screen_ = Screen::EDIT_BATTERY_V100; break;
-        case 11: screen_ = Screen::EDIT_BATTERY_DIVIDER; break;
-        case 12:
+        case 9:
+            // Тестовый поворот крана: захватываем ручное управление у ПИД
+            // и стартуем от текущего фактического положения, чтобы первый
+            // же поворот энкодера не дёрнул кран резко.
+            testValvePercent_ = ValveServo::getCurrentPercent();
+            ValveServo::setManualOverride(true);
+            ValveServo::setManualPercent(testValvePercent_);
+            screen_ = Screen::TEST_VALVE;
+            break;
+        case 10: screen_ = Screen::EDIT_BATTERY_V0; break;
+        case 11: screen_ = Screen::EDIT_BATTERY_V100; break;
+        case 12: screen_ = Screen::EDIT_BATTERY_DIVIDER; break;
+        case 13:
             strlcpy(textBuffer_, s->network.ssid, sizeof(textBuffer_));
             textLen_ = strlen(textBuffer_);
             textCharIndex_ = 0;
             textEditTarget_ = TextEditTarget::SSID;
             screen_ = Screen::EDIT_SSID;
             break;
-        case 13:
+        case 14:
             textBuffer_[0] = '\0';
             textLen_ = 0;
             textCharIndex_ = 0;
             textEditTarget_ = TextEditTarget::ADMIN_PASSWORD;
             screen_ = Screen::EDIT_SSID; // используем тот же экран-редактор текста
             break;
-        case 14: screen_ = Screen::SAVE_CONFIRM; break;
+        case 15: screen_ = Screen::EDIT_SLEEP_ENABLED; break;
+        case 16: screen_ = Screen::EDIT_SLEEP_TIMEOUT; break;
+        case 17: screen_ = Screen::SAVE_CONFIRM; break;
         default: screen_ = Screen::MENU; break;
     }
 }
@@ -211,6 +241,25 @@ static void applyEncoderToInt(uint8_t &value, int step, int minV, int maxV) {
     if (v < minV) v = minV;
     if (v > maxV) v = maxV;
     value = (uint8_t)v;
+    encoderDelta_ = 0;
+    dirty_ = true;
+}
+
+static void applyEncoderToUint16(uint16_t &value, int step, int minV, int maxV) {
+    if (encoderDelta_ == 0) return;
+    int v = (int)value + (int)(encoderDelta_ * step);
+    if (v < minV) v = minV;
+    if (v > maxV) v = maxV;
+    value = (uint16_t)v;
+    encoderDelta_ = 0;
+    dirty_ = true;
+}
+
+static void applyEncoderToBool(bool &value) {
+    if (encoderDelta_ == 0) return;
+    // Любое вращение энкодера переключает вкл/выкл - для тумблера
+    // направление не важно, важен сам факт поворота.
+    value = !value;
     encoderDelta_ = 0;
     dirty_ = true;
 }
@@ -259,6 +308,25 @@ static void drawNumberEditScreen(const char *label, double value, int decimals) 
     dtostrf(value, 0, decimals, buf);
     u8g2.setFont(u8g2_font_logisoso20_tn);
     u8g2.drawStr(10, 45, buf);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(0, 62, "Клик - сохранить");
+}
+
+static void drawTestValveScreen() {
+    u8g2.setFont(u8g2_font_7x14_tr);
+    u8g2.drawStr(0, 14, "Тест угла, %");
+    char buf[8];
+    dtostrf(testValvePercent_, 0, 0, buf);
+    u8g2.setFont(u8g2_font_logisoso20_tn);
+    u8g2.drawStr(10, 45, buf);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(0, 62, "Клик - выход из теста");
+}
+
+static void drawSleepEnabledScreen(bool value) {
+    u8g2.setFont(u8g2_font_7x14_tr);
+    u8g2.drawStr(0, 16, "Сон экрана");
+    u8g2.drawStr(10, 40, value ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН");
     u8g2.setFont(u8g2_font_6x10_tr);
     u8g2.drawStr(0, 62, "Клик - сохранить");
 }
@@ -360,10 +428,32 @@ static void handleNumberEditScreen(AppSettings *s) {
         case Screen::EDIT_BATTERY_V0: applyEncoderToFloat(s->battery.voltageAt0Percent, 0.05f, 0.0f, 60.0f); break;
         case Screen::EDIT_BATTERY_V100: applyEncoderToFloat(s->battery.voltageAt100Percent, 0.05f, 0.0f, 60.0f); break;
         case Screen::EDIT_BATTERY_DIVIDER: applyEncoderToFloat(s->battery.dividerRatio, 0.01f, 1.0f, 50.0f); break;
+        case Screen::EDIT_SLEEP_ENABLED: applyEncoderToBool(s->display.sleepEnabled); break;
+        // Таймаут сна: шаг 5с, от 5с до 10 минут (600с).
+        case Screen::EDIT_SLEEP_TIMEOUT: applyEncoderToUint16(s->display.sleepTimeoutSec, 5, 5, 600); break;
         default: break;
     }
 
     if (clickEvent_) {
+        screen_ = Screen::MENU;
+    }
+}
+
+// Тестовый поворот крана: крутим угол вручную, ПИД временно отключён
+// (см. ValveServo::setManualOverride). Настройки не изменяются и не
+// сохраняются - это разовое действие для проверки механики.
+static void handleTestValveScreen(AppSettings *s) {
+    if (encoderDelta_ != 0) {
+        testValvePercent_ += (double)encoderDelta_; // шаг 1% за "щелчок"
+        if (testValvePercent_ < s->servo.minPercent) testValvePercent_ = s->servo.minPercent;
+        if (testValvePercent_ > s->servo.maxPercent) testValvePercent_ = s->servo.maxPercent;
+        encoderDelta_ = 0;
+        ValveServo::setManualPercent(testValvePercent_);
+    }
+
+    if (clickEvent_) {
+        // Возвращаем управление краном ПИД-регулятору.
+        ValveServo::setManualOverride(false);
         screen_ = Screen::MENU;
     }
 }
@@ -488,15 +578,51 @@ void update() {
     pollButton();
 
     AppSettings *s = callbacks_.getSettings();
+    unsigned long nowMs = millis();
+
+    // ---------------- Сон экрана ----------------
+    if (sleeping_) {
+        if (clickEvent_) {
+            // Пробуждаемся по короткому клику кнопки энкодера. Сам клик
+            // "съедаем" здесь - он не долетает до текущего экрана, чтобы
+            // пробуждение не вызвало никакого нежелательного действия
+            // (например, случайного клика в открытом пункте меню).
+            sleeping_ = false;
+            lastInteractionMs_ = nowMs;
+            u8g2.setPowerSave(0);
+        }
+        // Пока спим, не копим повороты энкодера и долгие нажатия - иначе
+        // они "выстрелят" сразу после пробуждения неожиданно для пользователя.
+        encoderDelta_ = 0;
+        longPressEvent_ = false;
+        clickEvent_ = false;
+        if (sleeping_) return; // экран выключен - больше ничего не делаем
+    }
 
     // Автоблокировка: если меню было разблокировано, но им какое-то время
     // не пользовались, требуем пароль заново - как разлогинивание веб-сессии
     // по таймауту. Взаимодействием считаем любое вращение энкодера или клик.
     if (encoderDelta_ != 0 || clickEvent_ || longPressEvent_) {
-        lastInteractionMs_ = millis();
-    } else if (unlocked_ && (millis() - lastInteractionMs_ > MENU_LOCK_TIMEOUT_MS)) {
+        lastInteractionMs_ = nowMs;
+    } else if (unlocked_ && (nowMs - lastInteractionMs_ > MENU_LOCK_TIMEOUT_MS)) {
         unlocked_ = false;
-        if (screen_ != Screen::MENU) screen_ = Screen::MENU;
+        if (screen_ != Screen::MENU) {
+            // Если таймаут застал нас посреди тестового поворота крана -
+            // обязательно вернуть управление ПИД-регулятору, иначе кран
+            // останется зафиксирован в ручном положении без присмотра.
+            if (screen_ == Screen::TEST_VALVE) ValveServo::setManualOverride(false);
+            screen_ = Screen::MENU;
+        }
+    }
+
+    // Гасим экран после периода бездействия, если сон включён в настройках.
+    // Не гасим, пока не отрисован хотя бы первый кадр (lastRenderMs_ == 0)
+    // и пока активно взаимодействие (см. lastInteractionMs_ выше).
+    if (!sleeping_ && s->display.sleepEnabled && s->display.sleepTimeoutSec > 0 &&
+        (nowMs - lastInteractionMs_ > (unsigned long)s->display.sleepTimeoutSec * 1000UL)) {
+        sleeping_ = true;
+        u8g2.setPowerSave(1);
+        return;
     }
 
     switch (screen_) {
@@ -504,6 +630,7 @@ void update() {
         case Screen::EDIT_SSID: handleTextEditScreen(s); break;
         case Screen::ENTER_PASSWORD: handleEnterPasswordScreen(s); break;
         case Screen::SAVE_CONFIRM: handleSaveConfirmScreen(s); break;
+        case Screen::TEST_VALVE: handleTestValveScreen(s); break;
         default: handleNumberEditScreen(s); break;
     }
 
@@ -530,6 +657,9 @@ void update() {
         case Screen::EDIT_BATTERY_V0: drawNumberEditScreen("Батарея 0%, В", s->battery.voltageAt0Percent, 2); break;
         case Screen::EDIT_BATTERY_V100: drawNumberEditScreen("Батарея 100%, В", s->battery.voltageAt100Percent, 2); break;
         case Screen::EDIT_BATTERY_DIVIDER: drawNumberEditScreen("Коэф. делителя", s->battery.dividerRatio, 3); break;
+        case Screen::TEST_VALVE: drawTestValveScreen(); break;
+        case Screen::EDIT_SLEEP_ENABLED: drawSleepEnabledScreen(s->display.sleepEnabled); break;
+        case Screen::EDIT_SLEEP_TIMEOUT: drawNumberEditScreen("Таймаут сна, с", s->display.sleepTimeoutSec, 0); break;
         case Screen::EDIT_SSID: drawTextEditScreen(); break;
         case Screen::ENTER_PASSWORD: drawEnterPasswordScreen(); break;
         case Screen::SAVE_CONFIRM: drawSaveConfirmScreen(); break;

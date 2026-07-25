@@ -100,7 +100,7 @@
 
 // ---------------------- Файл настроек ----------------------
 #define CONFIG_FILE_PATH   "/config.json"
-#define CONFIG_JSON_CAPACITY  1280
+#define CONFIG_JSON_CAPACITY  1536
 
 // -----------------------------------------------------------------
 //                         Структуры данных
@@ -139,6 +139,14 @@ struct BatterySettings {
     float dividerRatio = BATTERY_DEFAULT_DIVIDER_RATIO;
 };
 
+struct DisplaySettings {
+    // Автоматическое гашение (сон) OLED-дисплея после периода бездействия -
+    // продлевает срок службы экрана и немного экономит энергию при питании
+    // от батареи. Выход из сна - по короткому клику кнопки энкодера.
+    bool sleepEnabled = true;
+    uint16_t sleepTimeoutSec = 30; // через сколько секунд бездействия гасить экран
+};
+
 struct AdminSettings {
     // Пароль для доступа к /settings в веб-интерфейсе (HTTP Basic Auth,
     // логин фиксирован - ADMIN_USERNAME) и для разблокировки меню настроек
@@ -155,6 +163,7 @@ struct AppSettings {
     NetworkSettings network;
     BatterySettings battery;
     AdminSettings admin;
+    DisplaySettings display;
 };
 
 // Точка истории температуры

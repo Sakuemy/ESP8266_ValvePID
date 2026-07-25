@@ -9,6 +9,7 @@ static double targetPercent_ = 0.0;
 static double currentPercent_ = 0.0;
 static unsigned long lastUpdateMs_ = 0;
 static bool attached_ = false;
+static bool manualOverride_ = false; // true во время ручного тестового поворота крана
 
 static uint16_t percentToPulse(double percent) {
     // Ограничиваем в первую очередь конфигурационными пределами крана
@@ -41,6 +42,21 @@ void applySettings(const ServoSettings &settings) {
 }
 
 void setTargetPercent(double percent) {
+    if (manualOverride_) return; // ручной тест активен - ПИД временно не управляет краном
+    if (percent < 0.0) percent = 0.0;
+    if (percent > 100.0) percent = 100.0;
+    targetPercent_ = percent;
+}
+
+void setManualOverride(bool active) {
+    manualOverride_ = active;
+}
+
+bool isManualOverrideActive() {
+    return manualOverride_;
+}
+
+void setManualPercent(double percent) {
     if (percent < 0.0) percent = 0.0;
     if (percent > 100.0) percent = 100.0;
     targetPercent_ = percent;

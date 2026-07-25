@@ -73,6 +73,10 @@ bool load(AppSettings &settings) {
     // Доступ к настройкам
     strlcpy(settings.admin.password, doc["admin"]["password"] | DEFAULT_ADMIN_PASSWORD, sizeof(settings.admin.password));
 
+    // Дисплей (сон)
+    settings.display.sleepEnabled    = doc["display"]["sleepEnabled"]    | true;
+    settings.display.sleepTimeoutSec = doc["display"]["sleepTimeoutSec"] | 30;
+
     return true;
 }
 
@@ -102,6 +106,9 @@ bool save(const AppSettings &settings) {
     doc["battery"]["dividerRatio"] = settings.battery.dividerRatio;
 
     doc["admin"]["password"] = settings.admin.password;
+
+    doc["display"]["sleepEnabled"]    = settings.display.sleepEnabled;
+    doc["display"]["sleepTimeoutSec"] = settings.display.sleepTimeoutSec;
 
     // Пишем во временный файл и затем переименовываем — так при внезапном
     // отключении питания старый рабочий конфиг не будет повреждён.
