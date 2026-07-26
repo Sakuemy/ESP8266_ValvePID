@@ -1,6 +1,7 @@
 #include "WebServerManager.h"
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
+#include <base64.h> // base64::decode - входит в состав ESP8266 core, доп. библиотека не нужна
 #include "TempSensor.h"
 #include "ValveServo.h"
 #include "TempHistory.h"
@@ -17,17 +18,34 @@ static Callbacks callbacks_;
 // ----------------------------------------------------------------------
 // Доступ по паролю (HTTP Basic Auth) к странице настроек и её API.
 // Дашборд (/, /api/status, /api/history) остаётся открытым для мониторинга.
-// Логин фиксирован (ADMIN_USERNAME), пароль - из settings.admin.password,
-// его можно сменить через /settings ("Безопасность") или через меню на
-// дисплее. Возвращает false и уже отправляет клиенту 401, если не прошли
-// проверку - вызывающий обработчик должен в этом случае просто выйти.
+// Логин фиксирован (ADMIN_USERNAME), пароль проверяется через
+// Storage::verifyPassword() (хранится только SHA-256 хэш, см. Storage.h) -
+// поэтому встроенный server.authenticate() тут не подходит (он сравнивает
+// с открытым паролем), разбираем заголовок Authorization вручную, по той
+// же схеме, что использует сам ESP8266HTTPUpdateServer из ядра. Возвращает
+// false и уже отправляет клиенту 401, если не прошли проверку - вызывающий
+// обработчик должен в этом случае просто выйти.
 static bool requireAuth() {
     AppSettings *s = callbacks_.getSettings();
-    if (!server.authenticate(ADMIN_USERNAME, s->admin.password)) {
-        server.requestAuthentication();
-        return false;
+
+    String authReq = server.header("Authorization");
+    if (authReq.startsWith("Basic ")) {
+        authReq = authReq.substring(6);
+        authReq.trim();
+        String decoded = base64::decode(authReq);
+        int colonIdx = decoded.indexOf(':');
+        if (colonIdx > 0) {
+            String user = decoded.substring(0, colonIdx);
+            String pass = decoded.substring(colonIdx + 1);
+            if (user == ADMIN_USERNAME && Storage::verifyPassword(*s, pass.c_str())) {
+                return true;
+            }
+        }
     }
-    return true;
+
+    server.sendHeader("WWW-Authenticate", "Basic realm=\"ValvePID\"");
+    server.send(401, "text/plain", "Unauthorized");
+    return false;
 }
 
 // ----------------------------------------------------------------------
@@ -171,6 +189,25 @@ button{margin-top:14px;padding:10px 18px;border:none;border-radius:6px;backgroun
 <button type="submit">Сохранить калибровку батареи</button><div class="msg" id="battMsg"></div>
 </form></div>
 
+<div class="card"><h1>Время / часовой пояс</h1>
+<p style="font-size:13px;color:#555;margin-top:0">Синхронизация времени идёт по NTP в UTC; здесь задаётся только смещение для отображения локального времени на графике. Работает без Wi-Fi только приблизительно (счёт от последней успешной синхронизации).</p>
+<form id="timeForm">
+<label>Часовой пояс (смещение от UTC)
+<select name="gmtOffsetHours">
+<option value="-12">UTC-12</option><option value="-11">UTC-11</option><option value="-10">UTC-10</option>
+<option value="-9">UTC-9</option><option value="-8">UTC-8</option><option value="-7">UTC-7</option>
+<option value="-6">UTC-6</option><option value="-5">UTC-5</option><option value="-4">UTC-4</option>
+<option value="-3">UTC-3</option><option value="-2">UTC-2</option><option value="-1">UTC-1</option>
+<option value="0">UTC+0</option><option value="1">UTC+1</option><option value="2">UTC+2 (Калининград)</option>
+<option value="3">UTC+3 (Москва)</option><option value="4">UTC+4 (Самара)</option><option value="5">UTC+5 (Екатеринбург)</option>
+<option value="5.5">UTC+5:30 (Индия)</option><option value="6">UTC+6 (Омск)</option><option value="7">UTC+7 (Красноярск)</option>
+<option value="8">UTC+8 (Иркутск)</option><option value="9">UTC+9 (Якутск)</option><option value="10">UTC+10 (Владивосток)</option>
+<option value="11">UTC+11 (Магадан)</option><option value="12">UTC+12 (Камчатка)</option><option value="13">UTC+13</option><option value="14">UTC+14</option>
+</select>
+</label>
+<button type="submit">Сохранить часовой пояс</button><div class="msg" id="timeMsg"></div>
+</form></div>
+
 <div class="card"><h1>Безопасность</h1>
 <p style="font-size:13px;color:#555;margin-top:0">Пароль для входа в эти настройки (веб и меню на дисплее). Логин фиксирован: <b>admin</b>.</p>
 <form id="secForm">
@@ -209,6 +246,8 @@ async function loadSettings(){
   sf.closedPulseUs.value = d.servo.closedPulseUs; sf.openPulseUs.value = d.servo.openPulseUs;
   const bf = document.getElementById('battForm');
   bf.v0.value = d.battery.v0; bf.v100.value = d.battery.v100; bf.dividerRatio.value = d.battery.dividerRatio;
+  const tf = document.getElementById('timeForm');
+  tf.gmtOffsetHours.value = (d.time.gmtOffsetSec / 3600);
   const nf = document.getElementById('netForm');
   nf.ssid.value = d.net.ssid; nf.dhcp.value = d.net.dhcp ? '1':'0';
   nf.ip.value = ipToStr(d.net.ip); nf.gateway.value = ipToStr(d.net.gateway);
@@ -237,6 +276,12 @@ document.getElementById('battForm').addEventListener('submit', function(e){
   e.preventDefault();
   const f = e.target;
   postForm('/api/settings/battery', {v0:f.v0.value, v100:f.v100.value, dividerRatio:f.dividerRatio.value}, 'battMsg');
+});
+document.getElementById('timeForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  const f = e.target;
+  const gmtOffsetSec = Math.round(parseFloat(f.gmtOffsetHours.value) * 3600);
+  postForm('/api/settings/time', {gmtOffsetSec}, 'timeMsg');
 });
 document.getElementById('secForm').addEventListener('submit', async function(e){
   e.preventDefault();
@@ -336,6 +381,8 @@ static void handleApiSettingsGet() {
     doc["battery"]["v100"] = s->battery.voltageAt100Percent;
     doc["battery"]["dividerRatio"] = s->battery.dividerRatio;
 
+    doc["time"]["gmtOffsetSec"] = s->time.gmtOffsetSec;
+
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
@@ -390,6 +437,25 @@ static void handleApiSettingsBattery() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Смещение часового пояса, в секундах от UTC. Диапазон ограничен реально
+// существующими часовыми поясами (-12..+14ч) на случай некорректного ввода.
+static void handleApiSettingsTime() {
+    if (!requireAuth()) return;
+    AppSettings *s = callbacks_.getSettings();
+    if (server.hasArg("gmtOffsetSec")) {
+        long offset = server.arg("gmtOffsetSec").toInt();
+        const long minOffset = -12L * 3600L;
+        const long maxOffset =  14L * 3600L;
+        if (offset < minOffset) offset = minOffset;
+        if (offset > maxOffset) offset = maxOffset;
+        s->time.gmtOffsetSec = (int32_t)offset;
+    }
+
+    Storage::save(*s);
+    if (callbacks_.onSettingsChanged) callbacks_.onSettingsChanged();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // Смена пароля доступа к настройкам. Требует правильный текущий пароль,
 // иначе тот, кто уже случайно оставил браузер авторизованным, не мог бы
 // незаметно "увести" устройство сменой пароля без знания старого.
@@ -400,7 +466,7 @@ static void handleApiSettingsSecurity() {
     String current = server.hasArg("currentPassword") ? server.arg("currentPassword") : "";
     String newPass  = server.hasArg("newPassword") ? server.arg("newPassword") : "";
 
-    if (current != String(s->admin.password)) {
+    if (!Storage::verifyPassword(*s, current.c_str())) {
         server.send(403, "application/json", "{\"ok\":false,\"error\":\"Неверный текущий пароль\"}");
         return;
     }
@@ -408,12 +474,12 @@ static void handleApiSettingsSecurity() {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"Пароль слишком короткий\"}");
         return;
     }
-    if (newPass.length() >= sizeof(s->admin.password)) {
+    if (newPass.length() >= ADMIN_PASSWORD_MAX_LEN) {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"Пароль слишком длинный\"}");
         return;
     }
 
-    strlcpy(s->admin.password, newPass.c_str(), sizeof(s->admin.password));
+    Storage::setPassword(*s, newPass.c_str());
     Storage::save(*s);
     if (callbacks_.onSettingsChanged) callbacks_.onSettingsChanged();
     server.send(200, "application/json", "{\"ok\":true}");
@@ -448,6 +514,12 @@ static void handleNotFound() {
 void begin(const Callbacks &callbacks) {
     callbacks_ = callbacks;
 
+    // Явно просим сервер сохранять заголовок Authorization - без этого
+    // server.header("Authorization") в requireAuth() всегда возвращал бы
+    // пустую строку (сервер по умолчанию не хранит произвольные заголовки).
+    static const char *authHeaderKeys[] = { "Authorization" };
+    server.collectHeaders(authHeaderKeys, 1);
+
     server.on("/", HTTP_GET, handleIndex);
     server.on("/settings", HTTP_GET, handleSettingsPage);
     server.on("/api/status", HTTP_GET, handleApiStatus);
@@ -456,6 +528,7 @@ void begin(const Callbacks &callbacks) {
     server.on("/api/settings/pid", HTTP_POST, handleApiSettingsPid);
     server.on("/api/settings/servo", HTTP_POST, handleApiSettingsServo);
     server.on("/api/settings/battery", HTTP_POST, handleApiSettingsBattery);
+    server.on("/api/settings/time", HTTP_POST, handleApiSettingsTime);
     server.on("/api/settings/network", HTTP_POST, handleApiSettingsNetwork);
     server.on("/api/settings/security", HTTP_POST, handleApiSettingsSecurity);
     server.onNotFound(handleNotFound);

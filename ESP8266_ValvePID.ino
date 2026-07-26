@@ -5,20 +5,29 @@
  *
  * Функционал:
  *  - Чтение температуры DS18B20 (неблокирующее).
- *  - ПИД-регулирование % открытия крана.
- *  - Веб-интерфейс: мониторинг (график 24ч), настройки ПИД/сервопривода/Wi-Fi.
- *  - Локальное меню на OLED + энкодере.
- *  - NTP-синхронизация времени с оффлайн-фолбэком.
- *  - Все пользовательские настройки хранятся в LittleFS (JSON),
- *    история температуры - только в RAM.
+ *  - ПИД-регулирование % открытия крана, плавный ход сервопривода.
+ *  - Тестовый ручной поворот крана на угол (меню на дисплее).
+ *  - Веб-интерфейс: мониторинг (график 24ч), настройки ПИД/сервопривода/
+ *    Wi-Fi/батареи/часового пояса.
+ *  - Локальное меню на OLED + энкодере, с автогашением (сон) экрана.
+ *  - NTP-синхронизация времени с оффлайн-фолбэком и настраиваемым
+ *    часовым поясом.
+ *  - Все пользовательские настройки хранятся в LittleFS (JSON); история
+ *    температуры живёт только в RAM (не переживает перезагрузку
+ *    устройства, но переживает перезагрузку страницы в браузере).
+ *  - Пароль администратора хранится только в виде SHA-256 хэша с солью.
+ *  - Безопасные положения крана: при потере датчика температуры или
+ *    критическом разряде батареи кран принудительно закрывается.
+ *  - OTA-обновление прошивки по Wi-Fi (ArduinoOTA).
  *
  * Требуемые библиотеки (Arduino Library Manager):
  *  - OneWire
  *  - DallasTemperature
  *  - ArduinoJson (v6.x)
  *  - U8g2
- *  (Servo, ESP8266WiFi, ESP8266WebServer, LittleFS идут в комплекте с
- *   ESP8266 core для Arduino)
+ *  (Servo, ESP8266WiFi, ESP8266WebServer, LittleFS, ArduinoOTA, base64,
+ *   BearSSL идут в комплекте с ESP8266 core для Arduino - отдельно
+ *   устанавливать не нужно)
  *
  * Плата: любая ESP8266 (NodeMCU, Wemos D1 mini и т.п.), см. пины в Config.h
  * =====================================================================
@@ -35,6 +44,7 @@
 #include "WebServerManager.h"
 #include "DisplayMenu.h"
 #include "BatteryMonitor.h"
+#include <ArduinoOTA.h> // входит в состав ESP8266 core, доп. библиотека не нужна
 
 static AppSettings settings;
 static PIDController pid;
@@ -59,6 +69,7 @@ static void onSettingsChanged() {
     pid.configure(settings.pid.kp, settings.pid.ki, settings.pid.kd, settings.pid.setpoint);
     ValveServo::applySettings(settings.servo);
     BatteryMonitor::applySettings(settings.battery);
+    TimeManager::applySettings(settings.time.gmtOffsetSec);
 
     // Сохранение в Flash делаем с небольшим дебаунсом на случай, если
     // несколько полей меняются подряд (например, при вводе через веб-форму) -
@@ -79,11 +90,28 @@ void setup() {
     ValveServo::begin(settings.servo);
     BatteryMonitor::begin(settings.battery);
     TempHistory::begin();
-    TimeManager::begin();
+    TimeManager::begin(settings.time.gmtOffsetSec);
 
     pid.configure(settings.pid.kp, settings.pid.ki, settings.pid.kd, settings.pid.setpoint);
 
     NetworkManager::begin(settings.network);
+
+    // OTA (обновление прошивки по Wi-Fi) - удобно, когда устройство уже
+    // установлено на месте (у крана/котла) и снимать его для прошивки по
+    // USB неудобно. Работает, как только Wi-Fi подключится (в STA-режиме;
+    // в режиме AP настройки недоступен, что ожидаемо).
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.onStart([]() {
+        Serial.println(F("[OTA] Начало обновления прошивки..."));
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println(F("[OTA] Обновление завершено, перезагрузка..."));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("[OTA] Ошибка (%u)\n", (unsigned)error);
+    });
+    ArduinoOTA.begin();
 
     WebServerManager::Callbacks webCb;
     webCb.getSettings = getSettingsPtr;
@@ -103,6 +131,7 @@ void loop() {
     // Каждый модуль сам решает, когда ему пора выполнить работу -
     // loop() не содержит блокирующих delay() и не переполняется.
     NetworkManager::update();
+    ArduinoOTA.handle();
     TimeManager::update(NetworkManager::isConnected());
     TempSensor::update();
     BatteryMonitor::update();

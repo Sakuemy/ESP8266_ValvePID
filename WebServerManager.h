@@ -13,10 +13,12 @@
  *   POST /api/settings/battery - калибровка батареи + коэфф. делителя A0, требует пароль
  *   POST /api/settings/network - обновление сетевых настроек (SSID/пароль/IP), требует пароль
  *   POST /api/settings/security- смена пароля доступа (текущий+новый), требует пароль
+ *   POST /api/settings/time    - часовой пояс (смещение от UTC), требует пароль
  *
- * Пароль - HTTP Basic Auth, логин фиксирован (ADMIN_USERNAME в Config.h),
- * сам пароль хранится в settings.admin.password (по умолчанию см.
- * DEFAULT_ADMIN_PASSWORD в Config.h - смените при первом запуске).
+ * Пароль - HTTP Basic Auth, логин фиксирован (ADMIN_USERNAME в Config.h).
+ * Сам пароль в открытом виде НЕ хранится - только SHA-256 хэш с солью
+ * (см. Storage::verifyPassword/setPassword). По умолчанию см.
+ * DEFAULT_ADMIN_PASSWORD в Config.h - смените при первом запуске.
  * -----------------------------------------------------------------
  */
 

@@ -4,6 +4,7 @@
 #include "NetworkManager.h"
 #include "BatteryMonitor.h"
 #include "ValveServo.h"
+#include "Storage.h"
 
 namespace DisplayMenu {
 
@@ -503,7 +504,7 @@ static void handleTextEditScreen(AppSettings *s) {
             dirty_ = true;
         } else if (textEditTarget_ == TextEditTarget::ADMIN_PASSWORD) {
             if (textLen_ >= 4) { // минимальная длина, как и в веб-форме
-                strlcpy(s->admin.password, textBuffer_, sizeof(s->admin.password));
+                Storage::setPassword(*s, textBuffer_);
                 dirty_ = true;
             }
         }
@@ -529,7 +530,7 @@ static void handleEnterPasswordScreen(AppSettings *s) {
     }
 
     if (longPressEvent_) {
-        if (strcmp(textBuffer_, s->admin.password) == 0) {
+        if (Storage::verifyPassword(*s, textBuffer_)) {
             unlocked_ = true;
             wrongPassword_ = false;
             lastInteractionMs_ = millis();

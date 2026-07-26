@@ -4,15 +4,33 @@
 namespace TimeManager {
 
 static bool syncedOnce_ = false;
-static uint32_t lastSyncEpoch_ = 0;      // unix-время на момент последней успешной синхронизации
+static uint32_t lastSyncEpoch_ = 0;      // unix-время (уже с учётом смещения) на момент последней успешной синхронизации
 static unsigned long lastSyncMillis_ = 0; // millis() на тот же момент
 static unsigned long lastSyncAttemptMs_ = 0;
+static int32_t gmtOffsetSec_ = 0;
 
-void begin() {
-    // Настраиваем SNTP. GMT-смещение = 0 (UTC), летнее время не учитываем -
-    // при необходимости сместите NTP_GMT_OFFSET_SEC под свой часовой пояс.
-    configTime(NTP_GMT_OFFSET_SEC, 0, NTP_SERVER_1, NTP_SERVER_2);
+void begin(int32_t gmtOffsetSec) {
+    gmtOffsetSec_ = gmtOffsetSec;
+    // Настраиваем SNTP. Первый параметр configTime() - смещение от UTC в
+    // секундах: ESP8266 SNTP сам добавляет его к получаемому времени, так
+    // что time(nullptr) далее уже возвращает "локальное" время напрямую.
+    configTime(gmtOffsetSec_, 0, NTP_SERVER_1, NTP_SERVER_2);
     lastSyncMillis_ = millis();
+}
+
+void applySettings(int32_t gmtOffsetSec) {
+    if (gmtOffsetSec == gmtOffsetSec_) return;
+
+    int32_t delta = gmtOffsetSec - gmtOffsetSec_;
+    gmtOffsetSec_ = gmtOffsetSec;
+    configTime(gmtOffsetSec_, 0, NTP_SERVER_1, NTP_SERVER_2);
+
+    if (syncedOnce_) {
+        // Сдвигаем уже накопленную опорную точку сразу же, не дожидаясь
+        // следующей плановой пересинхронизации (она бывает раз в 6 часов) -
+        // иначе сменивший часовой пояс увидит старое время ещё долго.
+        lastSyncEpoch_ = (uint32_t)((int64_t)lastSyncEpoch_ + delta);
+    }
 }
 
 void update(bool wifiConnected) {
@@ -29,6 +47,7 @@ void update(bool wifiConnected) {
     time_t nowSec = time(nullptr);
     // Пока SNTP не синхронизировался, time() возвращает малое значение
     // (близкое к 0, точка отсчёта эпохи). Порог 1700000000 ~ ноябрь 2023.
+    // Это уже "локальное" время (с учётом gmtOffsetSec_, см. begin()).
     if (nowSec > 1700000000UL) {
         lastSyncEpoch_ = (uint32_t)nowSec;
         lastSyncMillis_ = millis();

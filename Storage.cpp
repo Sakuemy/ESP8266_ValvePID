@@ -1,11 +1,62 @@
 #include "Storage.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <bearssl/bearssl_hash.h> // br_sha256_* - входит в состав ESP8266 core, доп. библиотека не нужна
 
 namespace Storage {
 
 static void applyDefaults(AppSettings &s) {
     s = AppSettings(); // структуры уже содержат разумные значения по умолчанию
+}
+
+// ----------------------------------------------------------------------
+// Пароль администратора: SHA-256(соль + пароль), соль случайна и
+// уникальна для устройства. Ничего из этого раздела не выставляется
+// наружу напрямую - только через verifyPassword()/setPassword().
+// ----------------------------------------------------------------------
+
+static void bytesToHex(const uint8_t *data, size_t len, char *out) {
+    static const char *hexChars = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2]     = hexChars[(data[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hexChars[data[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
+
+static void hashPasswordWithSalt(const char *password, const char *saltHex, char outHex65[65]) {
+    br_sha256_context ctx;
+    br_sha256_init(&ctx);
+    br_sha256_update(&ctx, saltHex, strlen(saltHex));
+    br_sha256_update(&ctx, password, strlen(password));
+    uint8_t digest[32];
+    br_sha256_out(&ctx, digest);
+    bytesToHex(digest, sizeof(digest), outHex65);
+}
+
+static void generateSalt(char outHex17[17]) {
+    // RANDOM_REG32 - аппаратный регистр случайных чисел ESP8266, доступен
+    // из Arduino-ядра без дополнительных подключений. Соль не секретна
+    // сама по себе (её единственная цель - защита от заранее посчитанных
+    // радужных таблиц для распространённых паролей), поэтому качества
+    // аппаратного RNG более чем достаточно.
+    uint8_t raw[8];
+    for (int i = 0; i < 8; i++) {
+        raw[i] = (uint8_t)(RANDOM_REG32 & 0xFF);
+    }
+    bytesToHex(raw, sizeof(raw), outHex17);
+}
+
+bool verifyPassword(const AppSettings &settings, const char *password) {
+    if (strlen(settings.admin.passwordHash) == 0) return false; // пароль ещё не установлен
+    char computed[65];
+    hashPasswordWithSalt(password, settings.admin.passwordSalt, computed);
+    return strcmp(computed, settings.admin.passwordHash) == 0;
+}
+
+void setPassword(AppSettings &settings, const char *newPassword) {
+    generateSalt(settings.admin.passwordSalt);
+    hashPasswordWithSalt(newPassword, settings.admin.passwordSalt, settings.admin.passwordHash);
 }
 
 bool begin() {
@@ -21,6 +72,7 @@ bool load(AppSettings &settings) {
     if (!LittleFS.exists(CONFIG_FILE_PATH)) {
         Serial.println(F("[Storage] Файл настроек не найден, создаю значения по умолчанию"));
         applyDefaults(settings);
+        setPassword(settings, DEFAULT_ADMIN_PASSWORD);
         save(settings);
         return true;
     }
@@ -29,6 +81,7 @@ bool load(AppSettings &settings) {
     if (!f) {
         Serial.println(F("[Storage] Не удалось открыть файл настроек"));
         applyDefaults(settings);
+        setPassword(settings, DEFAULT_ADMIN_PASSWORD);
         return false;
     }
 
@@ -40,6 +93,7 @@ bool load(AppSettings &settings) {
         Serial.print(F("[Storage] Ошибка разбора JSON: "));
         Serial.println(err.c_str());
         applyDefaults(settings);
+        setPassword(settings, DEFAULT_ADMIN_PASSWORD);
         save(settings);
         return false;
     }
@@ -80,12 +134,32 @@ bool load(AppSettings &settings) {
     settings.battery.voltageAt100Percent = doc["battery"]["v100"] | 4.2;
     settings.battery.dividerRatio        = doc["battery"]["dividerRatio"] | BATTERY_DEFAULT_DIVIDER_RATIO;
 
-    // Доступ к настройкам
-    strlcpy(settings.admin.password, doc["admin"]["password"] | DEFAULT_ADMIN_PASSWORD, sizeof(settings.admin.password));
+    // Доступ к настройкам - новый формат (хэш+соль)
+    strlcpy(settings.admin.passwordHash, doc["admin"]["passwordHash"] | "", sizeof(settings.admin.passwordHash));
+    strlcpy(settings.admin.passwordSalt, doc["admin"]["passwordSalt"] | "", sizeof(settings.admin.passwordSalt));
+
+    if (strlen(settings.admin.passwordHash) == 0) {
+        // Либо хэш ещё не был установлен, либо файл написан старой версией
+        // прошивки, хранившей пароль в открытом виде в поле "admin.password" -
+        // в обоих случаях аккуратно мигрируем на хэш и сразу же перезаписываем
+        // файл в новом формате (без plaintext-поля).
+        const char *legacyPlain = doc["admin"]["password"] | "";
+        if (strlen(legacyPlain) > 0) {
+            Serial.println(F("[Storage] Обнаружен пароль в открытом виде (старый формат файла) - перевожу на хэш"));
+            setPassword(settings, legacyPlain);
+        } else {
+            Serial.println(F("[Storage] Пароль администратора не задан - устанавливаю значение по умолчанию"));
+            setPassword(settings, DEFAULT_ADMIN_PASSWORD);
+        }
+        save(settings);
+    }
 
     // Дисплей (сон)
     settings.display.sleepEnabled    = doc["display"]["sleepEnabled"]    | true;
     settings.display.sleepTimeoutSec = doc["display"]["sleepTimeoutSec"] | 30;
+
+    // Время / часовой пояс
+    settings.time.gmtOffsetSec = doc["time"]["gmtOffsetSec"] | NTP_GMT_OFFSET_SEC_DEFAULT;
 
     return true;
 }
@@ -115,10 +189,13 @@ bool save(const AppSettings &settings) {
     doc["battery"]["v100"]         = settings.battery.voltageAt100Percent;
     doc["battery"]["dividerRatio"] = settings.battery.dividerRatio;
 
-    doc["admin"]["password"] = settings.admin.password;
+    doc["admin"]["passwordHash"] = settings.admin.passwordHash;
+    doc["admin"]["passwordSalt"] = settings.admin.passwordSalt;
 
     doc["display"]["sleepEnabled"]    = settings.display.sleepEnabled;
     doc["display"]["sleepTimeoutSec"] = settings.display.sleepTimeoutSec;
+
+    doc["time"]["gmtOffsetSec"] = settings.time.gmtOffsetSec;
 
     // Пишем во временный файл и затем переименовываем — так при внезапном
     // отключении питания старый рабочий конфиг не будет повреждён.
