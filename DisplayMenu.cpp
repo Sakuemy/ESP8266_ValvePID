@@ -5,6 +5,7 @@
 #include "BatteryMonitor.h"
 #include "ValveServo.h"
 #include "Storage.h"
+#include "Encoder.h"
 
 namespace DisplayMenu {
 
@@ -15,16 +16,9 @@ static bool displayOk_ = false; // true, если дисплей отозвал�
 
 static Callbacks callbacks_;
 
-// ---------------------- Энкодер (с гашением дребезга) ----------------------
-// CLK/DT читаются поллингом (не по прерыванию). Само по себе сравнение
-// "изменилось/не изменилось" на каждом вызове update() ловит и дребезг
-// контактов на фронтах - на нём один физический "щелчок" энкодера может
-// породить несколько ложных срабатываний. Поэтому изменение уровня CLK
-// принимается как достоверное только после того, как он удержался
-// стабильным не менее ENCODER_DEBOUNCE_MS.
-static int lastClkReading_ = HIGH; // последнее "сырое" чтение пина
-static int lastClkStable_  = HIGH; // последнее принятое (отфильтрованное) состояние
-static unsigned long lastClkChangeMs_ = 0;
+// ---------------------- Энкодер (по прерываниям) ----------------------
+// Вращение считается в Encoder.cpp по аппаратным прерываниям CLK/DT;
+// здесь только забираем накопленные щелчки в начале каждого update().
 static long encoderDelta_ = 0; // накопленные "щелчки" с прошлого чтения
 
 // ---------------------- Кнопка (с гашением дребезга) ----------------------
@@ -35,28 +29,6 @@ static unsigned long buttonPressStartMs_ = 0;
 static bool buttonHeld_ = false;
 static bool clickEvent_ = false;
 static bool longPressEvent_ = false;
-
-static void pollEncoder() {
-    unsigned long now = millis();
-    int reading = digitalRead(PIN_ENC_CLK);
-
-    if (reading != lastClkReading_) {
-        // Уровень изменился по сравнению с прошлым чтением - запоминаем
-        // момент и ждём, не "задребезжит" ли он обратно.
-        lastClkChangeMs_ = now;
-        lastClkReading_ = reading;
-    }
-
-    if ((now - lastClkChangeMs_) >= ENCODER_DEBOUNCE_MS && reading != lastClkStable_) {
-        // Уровень удержался стабильным дольше дебаунса - принимаем как
-        // настоящий фронт.
-        lastClkStable_ = reading;
-        if (reading == LOW) { // реагируем по фронту спада CLK
-            int dt = digitalRead(PIN_ENC_DT);
-            encoderDelta_ += (dt != reading) ? 1 : -1;
-        }
-    }
-}
 
 static void pollButton() {
     clickEvent_ = false;
@@ -112,12 +84,13 @@ enum class Screen : uint8_t {
     EDIT_DHCP_TOGGLE,
     EDIT_SLEEP_ENABLED,
     EDIT_SLEEP_TIMEOUT,
+    EDIT_TOLERANCE,
     SAVE_CONFIRM
 };
 
 static Screen screen_ = Screen::MENU;
 static int menuIndex_ = 0;
-static const int MENU_ITEMS_COUNT = 20;
+static const int MENU_ITEMS_COUNT = 21;
 static const char *MENU_LABELS[MENU_ITEMS_COUNT] = {
     "Температура",
     "IP адрес",
@@ -138,6 +111,7 @@ static const char *MENU_LABELS[MENU_ITEMS_COUNT] = {
     "Сменить пароль",
     "Сон экрана вкл/выкл",
     "Таймаут сна, с",
+    "Погрешность, C",
     "Сохранить/выход"
 };
 
@@ -187,16 +161,26 @@ static void enterMenuItem(int idx, AppSettings *s) {
         case 4: screen_ = Screen::EDIT_KI; break;
         case 5: screen_ = Screen::EDIT_KD; break;
         case 6: screen_ = Screen::EDIT_SETPOINT; break;
-        case 7: screen_ = Screen::EDIT_MIN_PERCENT; break;
-        case 8: screen_ = Screen::EDIT_MAX_PERCENT; break;
+        case 7:
+            // Серва сразу поворачивается на редактируемую границу хода, чтобы
+            // было видно, где кран окажется в минимуме.
+            ValveServo::previewPercent(s->servo.minPercent);
+            screen_ = Screen::EDIT_MIN_PERCENT;
+            break;
+        case 8:
+            ValveServo::previewPercent(s->servo.maxPercent);
+            screen_ = Screen::EDIT_MAX_PERCENT;
+            break;
         case 9: screen_ = Screen::EDIT_SERVO_CLOSED_PULSE; break;
         case 10: screen_ = Screen::EDIT_SERVO_OPEN_PULSE; break;
         case 11:
             // Тестовый поворот крана: захватываем ручное управление у ПИД
             // и стартуем от текущего фактического положения, чтобы первый
             // же поворот энкодера не дёрнул кран резко.
+            // Если активно аварийное закрытие (нет датчика / батарея) - ручной
+            // режим не включается, остаёмся в меню.
             testValvePercent_ = ValveServo::getCurrentPercent();
-            ValveServo::setManualOverride(true);
+            if (!ValveServo::setManualOverride(true)) break;
             ValveServo::setManualPercent(testValvePercent_);
             screen_ = Screen::TEST_VALVE;
             break;
@@ -219,7 +203,8 @@ static void enterMenuItem(int idx, AppSettings *s) {
             break;
         case 17: screen_ = Screen::EDIT_SLEEP_ENABLED; break;
         case 18: screen_ = Screen::EDIT_SLEEP_TIMEOUT; break;
-        case 19: screen_ = Screen::SAVE_CONFIRM; break;
+        case 19: screen_ = Screen::EDIT_TOLERANCE; break;
+        case 20: screen_ = Screen::SAVE_CONFIRM; break;
         default: screen_ = Screen::MENU; break;
     }
 }
@@ -435,16 +420,22 @@ static void handleNumberEditScreen(AppSettings *s) {
         case Screen::EDIT_KI: applyEncoderToDouble(s->pid.ki, 0.01, 0.0, 100.0); break;
         case Screen::EDIT_KD: applyEncoderToDouble(s->pid.kd, 0.01, 0.0, 100.0); break;
         case Screen::EDIT_SETPOINT: applyEncoderToDouble(s->pid.setpoint, 0.5, 0.0, 150.0); break;
+        // Допустимая погрешность температуры (зона нечувствительности), шаг 0.1 °C.
+        case Screen::EDIT_TOLERANCE: applyEncoderToDouble(s->pid.tolerance, 0.1, 0.0, 20.0); break;
         case Screen::EDIT_MIN_PERCENT:
             applyEncoderToInt(s->servo.minPercent, 1, 0, 100);
             // Не даём мин. открытию "перескочить" выше макс.: если пользователь
             // крутит мин. выше текущего макс., макс. подтягивается следом -
             // как две связанные "ручки" диапазона, без противоречивого состояния.
             if (s->servo.minPercent > s->servo.maxPercent) s->servo.maxPercent = s->servo.minPercent;
+            // Каждый такт подтверждаем предпросмотр: серва следует за значением
+            // и не возвращается в авто по тайм-ауту, пока экран открыт.
+            ValveServo::previewPercent(s->servo.minPercent);
             break;
         case Screen::EDIT_MAX_PERCENT:
             applyEncoderToInt(s->servo.maxPercent, 1, 0, 100);
             if (s->servo.maxPercent < s->servo.minPercent) s->servo.minPercent = s->servo.maxPercent;
+            ValveServo::previewPercent(s->servo.maxPercent);
             break;
         case Screen::EDIT_BATTERY_V0: applyEncoderToFloat(s->battery.voltageAt0Percent, 0.05f, 0.0f, 60.0f); break;
         case Screen::EDIT_BATTERY_V100: applyEncoderToFloat(s->battery.voltageAt100Percent, 0.05f, 0.0f, 60.0f); break;
@@ -455,12 +446,26 @@ static void handleNumberEditScreen(AppSettings *s) {
         // Калибровка импульсов сервопривода: диапазон 500..2500 мкс -
         // соответствует расширенному диапазону servo.attach() в ValveServo,
         // шаг 10 мкс для достаточно точной, но не слишком медленной настройки.
-        case Screen::EDIT_SERVO_CLOSED_PULSE: applyEncoderToUint16(s->servo.closedPulseUs, 10, 500, 2500); break;
-        case Screen::EDIT_SERVO_OPEN_PULSE: applyEncoderToUint16(s->servo.openPulseUs, 10, 500, 2500); break;
+        // Изменение сразу применяется к серве (предпросмотр калибровки, плавно);
+        // каждый такт подтверждаем его, пока экран открыт. В работу насовсем
+        // значения переходят после сохранения, иначе откатятся при выходе.
+        case Screen::EDIT_SERVO_CLOSED_PULSE:
+            applyEncoderToUint16(s->servo.closedPulseUs, 10, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US);
+            ValveServo::previewCalibration(s->servo.closedPulseUs, s->servo.openPulseUs);
+            break;
+        case Screen::EDIT_SERVO_OPEN_PULSE:
+            applyEncoderToUint16(s->servo.openPulseUs, 10, SERVO_PULSE_MIN_US, SERVO_PULSE_MAX_US);
+            ValveServo::previewCalibration(s->servo.closedPulseUs, s->servo.openPulseUs);
+            break;
         default: break;
     }
 
     if (clickEvent_) {
+        // Выход из редактирования: если это был предпросмотр min/max - кран
+        // возвращается к ПИД, предпросмотр калибровки откатывается (новые
+        // значения вступят в силу после сохранения).
+        ValveServo::endPreview();
+        ValveServo::endCalibrationPreview();
         screen_ = Screen::MENU;
     }
 }
@@ -469,6 +474,12 @@ static void handleNumberEditScreen(AppSettings *s) {
 // (см. ValveServo::setManualOverride). Настройки не изменяются и не
 // сохраняются - это разовое действие для проверки механики.
 static void handleTestValveScreen(AppSettings *s) {
+    // Ручной режим мог закончиться сам (аварийное закрытие, тайм-аут) -
+    // тогда экран теста больше не управляет краном, выходим в меню.
+    if (ValveServo::getMode() != ValveServo::Mode::MANUAL) {
+        screen_ = Screen::MENU;
+        return;
+    }
     if (encoderDelta_ != 0) {
         testValvePercent_ += (double)encoderDelta_; // шаг 1% за "щелчок"
         if (testValvePercent_ < s->servo.minPercent) testValvePercent_ = s->servo.minPercent;
@@ -568,11 +579,8 @@ static unsigned long lastRenderMs_ = 0;
 
 void begin(const Callbacks &callbacks) {
     callbacks_ = callbacks;
-    pinMode(PIN_ENC_CLK, INPUT_PULLUP);
-    pinMode(PIN_ENC_DT, INPUT_PULLUP);
+    Encoder::begin(); // CLK/DT - на прерываниях
     pinMode(PIN_ENC_BTN, INPUT_PULLUP);
-    lastClkReading_ = digitalRead(PIN_ENC_CLK);
-    lastClkStable_ = lastClkReading_;
     lastButtonReading_ = digitalRead(PIN_ENC_BTN);
     buttonStable_ = lastButtonReading_;
 
@@ -600,7 +608,7 @@ void begin(const Callbacks &callbacks) {
 }
 
 void update() {
-    pollEncoder();
+    encoderDelta_ += Encoder::takeDelta(); // щелчки, накопленные прерываниями
     pollButton();
 
     AppSettings *s = callbacks_.getSettings();
@@ -637,6 +645,8 @@ void update() {
             // обязательно вернуть управление ПИД-регулятору, иначе кран
             // останется зафиксирован в ручном положении без присмотра.
             if (screen_ == Screen::TEST_VALVE) ValveServo::setManualOverride(false);
+            ValveServo::endPreview(); // и предпросмотр min/max, если он шёл
+            ValveServo::endCalibrationPreview();
             screen_ = Screen::MENU;
         }
     }
@@ -678,6 +688,7 @@ void update() {
         case Screen::EDIT_KI: drawNumberEditScreen("Ki", s->pid.ki, 2); break;
         case Screen::EDIT_KD: drawNumberEditScreen("Kd", s->pid.kd, 2); break;
         case Screen::EDIT_SETPOINT: drawNumberEditScreen("Уставка, C", s->pid.setpoint, 1); break;
+        case Screen::EDIT_TOLERANCE: drawNumberEditScreen("Погрешность, C", s->pid.tolerance, 1); break;
         case Screen::EDIT_MIN_PERCENT: drawNumberEditScreen("Мин %", s->servo.minPercent, 0); break;
         case Screen::EDIT_MAX_PERCENT: drawNumberEditScreen("Макс %", s->servo.maxPercent, 0); break;
         case Screen::EDIT_SERVO_CLOSED_PULSE: drawNumberEditScreen("Закрыто, мкс", s->servo.closedPulseUs, 0); break;

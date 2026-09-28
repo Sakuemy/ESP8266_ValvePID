@@ -14,7 +14,10 @@ class PIDController {
 public:
     PIDController();
 
-    void configure(double kp, double ki, double kd, double setpoint);
+    // tolerance - допустимая погрешность, °C: пока |уставка - температура| не
+    // больше неё, регулятор "замирает" и возвращает прежний выход (кран не
+    // двигается), интеграл при этом не копится. 0 - зона выключена.
+    void configure(double kp, double ki, double kd, double setpoint, double tolerance = 0.0);
     void setSetpoint(double setpoint);
     void reset(); // сбросить интегральную составляющую и историю (при резких изменениях настроек)
 
@@ -23,6 +26,9 @@ public:
     double compute(double currentTemperature, double dtSeconds);
 
     double getSetpoint() const { return setpoint_; }
+    double getTolerance() const { return tolerance_; }
+    // true, если на последнем compute() температура была внутри зоны погрешности.
+    bool isHolding() const { return holding_; }
     double getKp() const { return kp_; }
     double getKi() const { return ki_; }
     double getKd() const { return kd_; }
@@ -30,6 +36,9 @@ public:
 private:
     double kp_, ki_, kd_;
     double setpoint_;
+    double tolerance_;
+    double lastOutput_;
+    bool holding_;
     double integral_;
     double prevError_;
     bool firstRun_;

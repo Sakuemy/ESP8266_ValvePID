@@ -103,6 +103,8 @@ bool load(AppSettings &settings) {
     settings.pid.ki = doc["pid"]["ki"] | 0.5;
     settings.pid.kd = doc["pid"]["kd"] | 1.0;
     settings.pid.setpoint = doc["pid"]["setpoint"] | 60.0;
+    settings.pid.tolerance = doc["pid"]["tolerance"] | 0.5;
+    if (settings.pid.tolerance < 0.0) settings.pid.tolerance = 0.0;
 
     // Сервопривод
     settings.servo.minPercent    = doc["servo"]["minPercent"]    | 0;
@@ -171,6 +173,7 @@ bool save(const AppSettings &settings) {
     doc["pid"]["ki"] = settings.pid.ki;
     doc["pid"]["kd"] = settings.pid.kd;
     doc["pid"]["setpoint"] = settings.pid.setpoint;
+    doc["pid"]["tolerance"] = settings.pid.tolerance;
 
     doc["servo"]["minPercent"]    = settings.servo.minPercent;
     doc["servo"]["maxPercent"]    = settings.servo.maxPercent;

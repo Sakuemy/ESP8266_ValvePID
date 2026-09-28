@@ -3,17 +3,20 @@
  * WebServerManager.h
  * -----------------------------------------------------------------
  * Встроенный веб-интерфейс:
- *   GET  /                     - дашборд (температура, % открытия, график 24ч), без пароля
+ *   GET  /                     - дашборд (температура, % открытия, график 24ч: температура + кран), без пароля
  *   GET  /settings             - настройки ПИД/сервопривода/сети/батареи, требует пароль (HTTP Basic Auth)
  *   GET  /api/status           - JSON текущего состояния (поллинг раз в секунду), без пароля
  *   GET  /api/history          - JSON истории температуры за 24ч, без пароля
  *   GET  /api/settings         - JSON текущих настроек (для заполнения формы), требует пароль
- *   POST /api/settings/pid     - обновление параметров ПИД, требует пароль
+ *   POST /api/settings/pid     - обновление параметров ПИД (вкл. допустимую погрешность), требует пароль
  *   POST /api/settings/servo   - обновление лимитов/калибровки сервопривода, требует пароль
  *   POST /api/settings/battery - калибровка батареи + коэфф. делителя A0, требует пароль
  *   POST /api/settings/network - обновление сетевых настроек (SSID/пароль/IP), требует пароль
  *   POST /api/settings/security- смена пароля доступа (текущий+новый), требует пароль
  *   POST /api/settings/time    - часовой пояс (смещение от UTC), требует пароль
+ *   POST /api/valve            - ручное управление краном (mode=auto|manual, percent), требует пароль
+ *   POST /api/servo/preview    - предпросмотр min/max: серва поворачивается на percent, требует пароль
+ *   POST /api/servo/test       - тест хода мин<->макс (action=start|stop, min, max), требует пароль
  *
  * Пароль - HTTP Basic Auth, логин фиксирован (ADMIN_USERNAME в Config.h).
  * Сам пароль в открытом виде НЕ хранится - только SHA-256 хэш с солью
@@ -31,6 +34,7 @@ namespace WebServerManager {
 struct Callbacks {
     AppSettings* (*getSettings)();
     void (*onSettingsChanged)(); // вызывается после того, как настройки изменены и сохранены
+    bool (*isPidHolding)();      // true, если температура в зоне погрешности (кран удерживается)
 };
 
 void begin(const Callbacks &callbacks);

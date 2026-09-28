@@ -6,8 +6,13 @@
  * Функционал:
  *  - Чтение температуры DS18B20 (неблокирующее).
  *  - ПИД-регулирование % открытия крана, плавный ход сервопривода.
- *  - Тестовый ручной поворот крана на угол (меню на дисплее).
- *  - Веб-интерфейс: мониторинг (график 24ч), настройки ПИД/сервопривода/
+ *  - Зона допустимой погрешности температуры (кран не дёргается внутри
+ *    setpoint +/- tolerance), настраивается в вебе и на дисплее.
+ *  - Ручное управление краном (веб и меню на дисплее), предпросмотр
+ *    min/max (серва поворачивается на редактируемую границу) и тест хода
+ *    мин<->макс.
+ *  - Энкодер обрабатывается по аппаратным прерываниям (Encoder.cpp).
+ *  - Веб-интерфейс: мониторинг (график 24ч: температура + работа сервопривода), настройки ПИД/сервопривода/
  *    Wi-Fi/батареи/часового пояса.
  *  - Локальное меню на OLED + энкодере, с автогашением (сон) экрана.
  *  - NTP-синхронизация времени с оффлайн-фолбэком и настраиваемым
@@ -53,6 +58,8 @@ static unsigned long lastPidComputeMs = 0;
 static unsigned long lastSettingsSaveMs = 0;
 static bool settingsSavePending = false;
 static bool batteryCriticalLogged = false; // чтобы не спамить Serial каждый цикл
+static bool sensorLostLogged = false;
+static bool wasValveManual = false;         // предыдущее состояние "кран не под ПИД" - для сброса ПИД при выходе
 
 // ---------------------------------------------------------------------
 // Общие колбэки для веб-сервера и дисплейного меню: они работают с одним
@@ -64,9 +71,15 @@ static AppSettings *getSettingsPtr() {
     return &settings;
 }
 
+// Для веб-статуса: находится ли температура сейчас в зоне погрешности
+// (кран удерживается на месте).
+static bool isPidHolding() {
+    return pid.isHolding();
+}
+
 static void onSettingsChanged() {
     // Применяем изменения немедленно, без перезагрузки устройства.
-    pid.configure(settings.pid.kp, settings.pid.ki, settings.pid.kd, settings.pid.setpoint);
+    pid.configure(settings.pid.kp, settings.pid.ki, settings.pid.kd, settings.pid.setpoint, settings.pid.tolerance);
     ValveServo::applySettings(settings.servo);
     BatteryMonitor::applySettings(settings.battery);
     TimeManager::applySettings(settings.time.gmtOffsetSec);
@@ -79,7 +92,9 @@ static void onSettingsChanged() {
 }
 
 void setup() {
-    Serial.begin(115200);
+    // Только передача: GPIO3 (RX) занят под DT энкодера (PIN_ENC_DT). Отладочный
+    // вывод в Serial Monitor работает как обычно, приём с Serial недоступен.
+    Serial.begin(115200, SERIAL_8N1, SERIAL_TX_ONLY);
     delay(200);
     Serial.println(F("\n[Boot] ESP8266 Valve PID Controller"));
 
@@ -92,7 +107,7 @@ void setup() {
     TempHistory::begin();
     TimeManager::begin(settings.time.gmtOffsetSec);
 
-    pid.configure(settings.pid.kp, settings.pid.ki, settings.pid.kd, settings.pid.setpoint);
+    pid.configure(settings.pid.kp, settings.pid.ki, settings.pid.kd, settings.pid.setpoint, settings.pid.tolerance);
 
     NetworkManager::begin(settings.network);
 
@@ -116,6 +131,7 @@ void setup() {
     WebServerManager::Callbacks webCb;
     webCb.getSettings = getSettingsPtr;
     webCb.onSettingsChanged = onSettingsChanged;
+    webCb.isPidHolding = isPidHolding;
     WebServerManager::begin(webCb);
 
     DisplayMenu::Callbacks dispCb;
@@ -138,33 +154,43 @@ void loop() {
 
     unsigned long now = millis();
 
+    // Пока кран не под ПИД (ручной режим из меню/веба, предпросмотр min/max,
+    // тест хода) - ПИД не считаем, чтобы его интеграл не "накручивался"
+    // впустую. При возврате в авто сбрасываем ПИД: накопленное до ручного
+    // режима состояние уже не соответствует положению крана.
+    bool valveManual = ValveServo::isManualOverrideActive();
+    if (wasValveManual && !valveManual) {
+        pid.reset();
+    }
+    wasValveManual = valveManual;
+
     if (now - lastPidComputeMs >= PID_COMPUTE_INTERVAL_MS) {
         double dtSeconds = (now - lastPidComputeMs) / 1000.0;
         lastPidComputeMs = now;
 
-        if (TempSensor::isValid()) {
+        if (valveManual) {
+            // кран ведёт человек/тест - ПИД молчит
+        } else if (TempSensor::isValid()) {
             double percent = pid.compute(TempSensor::getTemperature(), dtSeconds);
             ValveServo::setTargetPercent(percent);
-        } else {
-            // Нет валидных данных с датчика - переводим кран в безопасное
-            // (минимальное) положение, чтобы не оставлять его открытым
-            // "вслепую" при отказе сенсора.
-            ValveServo::setTargetPercent(settings.servo.minPercent);
         }
+        // Нет валидных данных с датчика - см. аварийное закрытие ниже.
     }
 
-    // Критически низкий заряд батареи (если она вообще физически
-    // подключена - см. BatteryMonitor::isConnected()) - принудительно
-    // держим кран в минимальном (безопасном) положении, перекрывая то,
-    // что мог выставить ПИД в этом цикле. Проверяем и применяем ДО
-    // ValveServo::update(), чтобы сработало в этом же такте, а не с
-    // задержкой до следующего. Ничего не сохраняем и не блокируем - как
-    // только заряд восстановится (или батарею зарядят/заменят), обычная
-    // логика вернётся сама, без перезагрузки.
+    // Аварийное закрытие: нет валидных данных датчика температуры ИЛИ
+    // критически низкий заряд батареи (если она физически подключена - см.
+    // BatteryMonitor::isConnected()). Кран уходит в минимальное (безопасное)
+    // положение в ЛЮБОМ режиме - ПИД, ручной, предпросмотр, тест (ручной
+    // режим/тест при этом прерываются), ход по-прежнему плавный. Флаг
+    // передаётся ДО ValveServo::update(), чтобы сработать в этом же такте.
+    // Ничего не сохраняем и не блокируем - как только датчик вернётся или
+    // заряд восстановится, обычная логика вернётся сама, без перезагрузки.
+    bool sensorLost = !TempSensor::isValid();
     bool batteryCritical = BatteryMonitor::isConnected() &&
                             BatteryMonitor::getPercent() < BATTERY_CRITICAL_PERCENT;
+    ValveServo::setSafetyClose(sensorLost || batteryCritical);
+
     if (batteryCritical) {
-        ValveServo::setTargetPercent(settings.servo.minPercent);
         if (!batteryCriticalLogged) {
             Serial.println(F("[Main] Критически низкий заряд батареи - кран переведён в безопасное положение"));
             batteryCriticalLogged = true;
@@ -172,11 +198,19 @@ void loop() {
     } else {
         batteryCriticalLogged = false;
     }
+    if (sensorLost) {
+        if (!sensorLostLogged) {
+            Serial.println(F("[Main] Нет данных датчика температуры - кран переведён в безопасное положение"));
+            sensorLostLogged = true;
+        }
+    } else {
+        sensorLostLogged = false;
+    }
 
     ValveServo::update();
 
     if (TempSensor::isValid()) {
-        TempHistory::update(TempSensor::getTemperature(), TimeManager::now());
+        TempHistory::update(TempSensor::getTemperature(), (float)ValveServo::getCurrentPercent(), TimeManager::now());
     }
 
     WebServerManager::update();

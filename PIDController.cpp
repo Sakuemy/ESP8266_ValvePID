@@ -1,14 +1,18 @@
 #include "PIDController.h"
 
 PIDController::PIDController()
-    : kp_(20.0), ki_(0.5), kd_(1.0), setpoint_(60.0),
+    : kp_(20.0), ki_(0.5), kd_(1.0), setpoint_(60.0), tolerance_(0.0),
+      lastOutput_(0.0), holding_(false),
       integral_(0.0), prevError_(0.0), firstRun_(true) {}
 
-void PIDController::configure(double kp, double ki, double kd, double setpoint) {
+void PIDController::configure(double kp, double ki, double kd, double setpoint, double tolerance) {
     kp_ = kp;
     ki_ = ki;
     kd_ = kd;
     setpoint_ = setpoint;
+    tolerance_ = tolerance < 0.0 ? 0.0 : tolerance;
+    // lastOutput_ намеренно НЕ сбрасываем: иначе смена любой настройки, пока
+    // температура в зоне погрешности, закрыла бы кран (выход 0).
     reset();
 }
 
@@ -26,6 +30,17 @@ double PIDController::compute(double currentTemperature, double dtSeconds) {
     if (dtSeconds <= 0.0) dtSeconds = 0.001; // защита от деления на ноль/некорректного dt
 
     double error = setpoint_ - currentTemperature;
+
+    // Зона погрешности: температура "достаточно близка" к уставке - держим
+    // кран как есть. prevError_ обновляем, чтобы при выходе из зоны не было
+    // скачка производной; интеграл не трогаем (не копим и не сбрасываем).
+    if (tolerance_ > 0.0 && fabs(error) <= tolerance_) {
+        holding_ = true;
+        prevError_ = error;
+        firstRun_ = false;
+        return lastOutput_;
+    }
+    holding_ = false;
 
     // Предварительный (без интеграла) выход, чтобы понять, не в насыщении ли мы —
     // если да, не накапливаем интеграл дальше в ту же сторону (anti-windup).
@@ -49,6 +64,7 @@ double PIDController::compute(double currentTemperature, double dtSeconds) {
 
     prevError_ = error;
     firstRun_ = false;
+    lastOutput_ = output;
 
     return output;
 }
